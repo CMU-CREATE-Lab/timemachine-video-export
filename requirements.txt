@@ -1,0 +1,10 @@
+requests
+pandas>=1.0.0
+numpy
+pytz
+python-dateutil
+gspread
+oauth2client
+google-api-python-client
+psutil
+Pillow
