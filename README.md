@@ -86,6 +86,7 @@ python -m timemachine_video_export.batch_video_exporter "Spreadsheet Name" --exp
 
 ```bash
 pytest tests/
+pytest tests/ --runslow  # include slow integration tests
 ```
 
 Key test files:
