@@ -67,6 +67,21 @@ end = datetime(2025, 2, 15, 8, 5, 0, tzinfo=ZoneInfo("America/New_York"))
 render_video_site("Clairton", begin, end, "output.mp4")
 ```
 
+### Command-line render
+
+Render an MP4 from a TimeMachine root URL with explicit source rect, output size, and time range:
+
+```bash
+timemachine-render \
+    --url https://tiles.cmucreatelab.org/ecam/timemachines/clairton4/2025-02-15.timemachine \
+    --begin '2025-02-15 08:00:00' --end '2025-02-15 08:01:00' \
+    --timezone America/New_York \
+    --source-rect 0,0,6613,2717 --size 3840x2160 \
+    --output clairton.mp4
+```
+
+`--timezone` is optional if `--begin`/`--end` include an offset (e.g. `2025-02-15T08:00:00-05:00`).
+
 ### Command-line batch exporter
 
 The batch exporter reads a queue of export requests from a Google Spreadsheet and renders them. It requires Google API credentials and additional dependencies (`gspread`, `oauth2client`, `google-api-python-client`).
