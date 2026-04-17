@@ -1,7 +1,7 @@
 import pytest
 from timemachine_video_export.video_renderer import (
     OutputToVideo, Thumbnails,
-    render_video_from_thumbnail, render_video_site,
+    render_video, render_video_from_thumbnail, render_video_site,
 )
 from timemachine_video_export import BreathecamThumbnail, Rectangle
 from datetime import datetime
@@ -93,6 +93,27 @@ def test_clairton_squeeze1():
     thumbnail.set_view_rect(Rectangle(0, 0, 6613, 2717))
 
     render_test_clairton_thumbnail(thumbnail, "test_outputs/test_clairton_squeeze1.mp4")
+
+# Same output as test_clairton_squeeze1, but constructed from explicit primitives
+# (timemachine URL, times, source rect, output size). This is the shape that the
+# upcoming command-line tool will accept.
+def test_clairton_squeeze1_from_scratch():
+    timemachine_root_url = "https://tiles.cmucreatelab.org/ecam/timemachines/clairton4/2025-02-15.timemachine"
+    begin_datetime = datetime(2025, 2, 15, 8, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+    end_datetime = datetime(2025, 2, 15, 8, 1, 0, tzinfo=ZoneInfo("America/New_York"))
+    source_rect = Rectangle(0, 0, 6613, 2717)
+    output_width = 3840
+    output_height = 2160
+
+    test_file = "test_outputs/test_clairton_squeeze1_from_scratch.mp4"
+    output = OutputToVideo(test_file, output_width, output_height)
+    render_video(
+        timemachine_root_url=timemachine_root_url,
+        begin_datetime=begin_datetime,
+        end_datetime=end_datetime,
+        source_rect=source_rect,
+        output=output,
+    )
 
 def test_clairton_10_pct_offset():
     thumbnail = get_test_clairton_thumbnail()

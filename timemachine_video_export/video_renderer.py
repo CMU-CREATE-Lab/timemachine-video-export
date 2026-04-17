@@ -246,23 +246,30 @@ def render_video_site(site: str, begin_datetime: datetime.datetime, end_datetime
 #     def close(self):
 #         pass
 
-def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVideo, thumbnail: BreathecamThumbnail):
-    timemachine = TimeMachine.from_breathecam_thumbnail(thumbnail)
+def render_video(
+    timemachine_root_url: str,
+    begin_datetime: datetime.datetime,
+    end_datetime: datetime.datetime,
+    source_rect: Rectangle,
+    output: OutputToVideo,
+):
+    """Render a video from a TimeMachine root URL.
 
-    # TO DO: Download multiple shards in parallel
-
-    source_width = thumbnail.view_rect().width
-    source_height = thumbnail.view_rect().height
-
-    # Encode frames into mp4 using external ffmpeg process
-    output_width = ensure_integer(thumbnail.width)
-    output_height = ensure_integer(thumbnail.height)
-
-    # Make sure the output dimensions match the thumbnail dimensions
-    assert output.width == output_width, f"Output width {output.width} does not match thumbnail"
-    assert output.height == output_height, f"Output height {output.height} does not match thumbnail"
+    Args:
+        timemachine_root_url: e.g. https://tiles.cmucreatelab.org/ecam/timemachines/clairton4/2025-02-15.timemachine
+        begin_datetime, end_datetime: timezone-aware datetimes bounding the frames to render
+        source_rect: Rectangle in full-resolution TimeMachine coordinates (may be non-integer)
+        output: sink with .width/.height/.write_frame/.close (output dimensions come from this)
+    """
+    assert begin_datetime.tzinfo is not None, "begin_datetime must have a timezone"
+    assert end_datetime.tzinfo is not None, "end_datetime must have a timezone"
     assert output.width % 2 == 0, "Output width must be even"
     assert output.height % 2 == 0, "Output height must be even"
+
+    timemachine = TimeMachine(timemachine_root_url)
+
+    output_width = output.width
+    output_height = output.height
 
     start_frame = timemachine.frameno_from_date_after_or_equal(begin_datetime)
     end_frame = timemachine.frameno_from_date_before_or_equal(end_datetime)
@@ -277,7 +284,7 @@ def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVi
     # Download a range of frames, possibly rendering subsamples and extracting/resizing to match requested view rect
     def download_chunk(chunk_info):
         chunk_start, chunk_frames = chunk_info
-        frames = timemachine.download_scaled_video_frame_range(chunk_start, chunk_frames, thumbnail.view_rect(), output_width, output_height)
+        frames = timemachine.download_scaled_video_frame_range(chunk_start, chunk_frames, source_rect, output_width, output_height)
         assert frames[0].shape == (output_height, output_width, 3), f"Frame shape {frames[0].shape} does not match expected {(output_height, output_width, 3)}"
         print(f"BatchVideoExporter: Downloaded {len(frames)} frames")
         return frames
@@ -323,3 +330,17 @@ def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVi
     elapsed = time.monotonic() - render_start_time
     fps = nframes / elapsed if elapsed > 0 else float('inf')
     print(f"Rendered {output_width}x{output_height}, {nframes} frames in {elapsed:.1f}s ({fps:.2f} fps)")
+
+
+def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVideo, thumbnail: BreathecamThumbnail):
+    output_width = ensure_integer(thumbnail.width)
+    output_height = ensure_integer(thumbnail.height)
+    assert output.width == output_width, f"Output width {output.width} does not match thumbnail"
+    assert output.height == output_height, f"Output height {output.height} does not match thumbnail"
+    render_video(
+        timemachine_root_url=thumbnail.timemachine_root_url(),
+        begin_datetime=begin_datetime,
+        end_datetime=end_datetime,
+        source_rect=thumbnail.view_rect(),
+        output=output,
+    )
