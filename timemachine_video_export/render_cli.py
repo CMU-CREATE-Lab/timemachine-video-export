@@ -5,7 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .rectangle import Rectangle
-from .video_renderer import OutputToVideo, render_video
+from .video_renderer import OutputToStream, OutputToVideo, render_video
 
 
 def _parse_datetime(s: str, default_tz):
@@ -82,7 +82,12 @@ def main(argv=None):
                         metavar="WxH",
                         help="Output size in pixels. Both dimensions must be even.")
     parser.add_argument("--output", required=True,
-                        help="Output MP4 path.")
+                        help="Output path, or - for stdout (rgb format only).")
+    parser.add_argument("--format", choices=["mp4", "rgb"], default=None,
+                        help="Output format. 'rgb' writes raw uint8 RGB frames "
+                             "(width*height*3 bytes per frame, rows top-to-bottom). "
+                             "If omitted, inferred from --output extension (.mp4/.rgb); "
+                             "required when --output is -.")
     args = parser.parse_args(argv)
 
     try:
@@ -92,7 +97,38 @@ def main(argv=None):
         parser.error(str(e))
 
     width, height = args.size
-    output = OutputToVideo(args.output, width, height)
+    fmt = args.format or _infer_format(args.output, parser)
+
+    if fmt == "mp4":
+        if args.output == "-":
+            parser.error("mp4 format cannot write to stdout; use --format rgb or a file path")
+        _do_render(args, begin, end, OutputToVideo(args.output, width, height))
+    else:  # rgb
+        if args.output == "-":
+            # Preserve binary stdout before any print() can reach it; redirect
+            # text-mode print() calls to stderr so they don't corrupt the stream.
+            raw_stream = sys.stdout.buffer
+            sys.stdout = sys.stderr
+            _do_render(args, begin, end, OutputToStream(raw_stream, width, height))
+        else:
+            with open(args.output, "wb") as raw_stream:
+                _do_render(args, begin, end, OutputToStream(raw_stream, width, height))
+
+
+def _infer_format(output_path, parser):
+    if output_path == "-":
+        parser.error("--format is required when --output is -")
+    lower = output_path.lower()
+    if lower.endswith(".mp4"):
+        return "mp4"
+    if lower.endswith(".rgb"):
+        return "rgb"
+    parser.error(
+        f"Cannot infer --format from {output_path!r}; pass --format mp4 or --format rgb"
+    )
+
+
+def _do_render(args, begin, end, output):
     render_video(
         timemachine_root_url=args.url,
         begin_datetime=begin,

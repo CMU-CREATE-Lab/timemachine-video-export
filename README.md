@@ -82,6 +82,13 @@ timemachine-render \
 
 `--timezone` is optional if `--begin`/`--end` include an offset (e.g. `2025-02-15T08:00:00-05:00`).
 
+To emit raw uint8 RGB frames instead of MP4, use `--format rgb` (or an `.rgb` output path). The stream is `width*height*3` bytes per frame, rows top-to-bottom. Passing `--output -` writes to stdout (logs are redirected to stderr):
+
+```bash
+timemachine-render ... --size 3840x2160 --output - --format rgb \
+  | ffmpeg -f rawvideo -pix_fmt rgb24 -s 3840x2160 -r 30 -i - -c:v libx264 out.mp4
+```
+
 ### Command-line batch exporter
 
 The batch exporter reads a queue of export requests from a Google Spreadsheet and renders them. It requires Google API credentials and additional dependencies (`gspread`, `oauth2client`, `google-api-python-client`).
