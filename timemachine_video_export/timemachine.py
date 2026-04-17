@@ -305,11 +305,25 @@ class TimeMachine:
         # Create output array
         result = np.zeros((nframes, output_height, output_width, 3), dtype=np.uint8)
 
-        # Resize each frame using PIL with floating-point source box
-        for i in range(nframes):
+        # Resize each frame using PIL with floating-point source box.
+        # PIL LANCZOS releases the GIL, so thread-parallelism scales well.
+        def resize_one(i):
             img = Image.fromarray(download[i])
             resized = img.resize((output_width, output_height), resample=Image.LANCZOS, box=crop_box)
             result[i] = np.array(resized)
+
+        # Only pay the thread-pool overhead when the per-frame resize is large enough
+        # to dominate it. Threshold picked empirically: resizes below ~1 megapixel run
+        # faster serially.
+        output_megapixels = (output_width * output_height) / 1_000_000
+        use_threads = nframes > 1 and max_threads > 1 and output_megapixels >= 1.0
+        if use_threads:
+            with ThreadPoolExecutor(max_workers=min(max_threads, nframes)) as executor:
+                for _ in executor.map(resize_one, range(nframes)):
+                    pass
+        else:
+            for i in range(nframes):
+                resize_one(i)
 
         return result
 

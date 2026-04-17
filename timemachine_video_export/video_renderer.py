@@ -5,6 +5,7 @@ import threading
 import datetime
 import subprocess
 import re
+import time
 
 from .thumbnail_api import BreathecamThumbnail
 from .timemachine import TimeMachine
@@ -267,6 +268,8 @@ def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVi
     end_frame = timemachine.frameno_from_date_before_or_equal(end_datetime)
     nframes = end_frame - start_frame + 1
 
+    render_start_time = time.monotonic()
+
     # We have to process in small chunks or we run out of RAM
     chunk_size = 200
     frame_chunks = range(start_frame, start_frame + nframes, chunk_size)
@@ -316,3 +319,7 @@ def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVi
                 for frame in frames:
                     output.write_frame(frame)
     output.close()
+
+    elapsed = time.monotonic() - render_start_time
+    fps = nframes / elapsed if elapsed > 0 else float('inf')
+    print(f"Rendered {output_width}x{output_height}, {nframes} frames in {elapsed:.1f}s ({fps:.2f} fps)")
