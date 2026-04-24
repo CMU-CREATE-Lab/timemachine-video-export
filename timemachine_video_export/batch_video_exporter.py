@@ -200,7 +200,7 @@ class BatchVideoExporter:
         try:
             worksheet.format(f"{col_letter}{sheet_row}", {
                 "wrapStrategy": "WRAP",
-                "textFormat": {"fontSize": 9},
+                "textFormat": {"fontSize": 7},
             })
         except Exception as ex:
             print(f"BatchVideoExporter: failed to style Status cell: {ex}")

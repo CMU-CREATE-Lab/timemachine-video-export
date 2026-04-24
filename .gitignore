@@ -53,3 +53,8 @@ env/
 *.mp4
 *.rgb
 test_outputs/
+
+# Local secrets and runtime artifacts
+secrets/
+exports/
+export_log_*.txt
