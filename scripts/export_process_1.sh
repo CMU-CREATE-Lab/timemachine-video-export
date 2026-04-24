@@ -1,14 +1,17 @@
 #!/bin/bash
 
-echo "Starting export_process_1.sh" >> export_log_1.txt
-# Add /usr/local/bin to PATH
-export PATH=$PATH:/usr/local/bin
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+LOG_FILE="$PROJECT_DIR/export_log_1.txt"
 
-# Set environment variables for secrets and export directories
-export BREATHECAM_SECRETS_PATH="${BREATHECAM_SECRETS_PATH:-/home/rsargent/projects/plume_detect/secrets}"
-export BREATHECAM_EXPORT_DIR="${BREATHECAM_EXPORT_DIR:-/home/rsargent/projects/plume_detect/exports}"
+echo "Starting export_process_1.sh" >> "$LOG_FILE"
 
-cd /home/rsargent/projects/plume_detect
+# ffmpeg/ffprobe are located via PATH or the FFMPEG_DIR env var
+# (set FFMPEG_DIR in the crontab if ffmpeg isn't on PATH).
+export BREATHECAM_SECRETS_PATH="${BREATHECAM_SECRETS_PATH:-$PROJECT_DIR/secrets}"
+export BREATHECAM_EXPORT_DIR="${BREATHECAM_EXPORT_DIR:-$PROJECT_DIR/exports}"
+
+cd "$PROJECT_DIR"
 source venv/bin/activate
-python -u -m timemachine_video_export.batch_video_exporter "Natisha Breathe Cam video exports" --export-next >> export_log_1.txt 2>&1
-echo "Finished export_process_1.sh" >> export_log_1.txt
+python -u -m timemachine_video_export.batch_video_exporter "Natisha Breathe Cam video exports" --export-next >> "$LOG_FILE" 2>&1
+echo "Finished export_process_1.sh" >> "$LOG_FILE"

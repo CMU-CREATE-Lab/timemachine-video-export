@@ -11,6 +11,7 @@ from .thumbnail_api import BreathecamThumbnail
 from .timemachine import TimeMachine
 from concurrent.futures import ThreadPoolExecutor
 from .rectangle import Rectangle
+from .ffmpeg_path import resolve_ffmpeg_tool
 
 
 class Thumbnails:
@@ -124,7 +125,7 @@ class OutputToVideo:
 
         # Set up the process with stderr redirected to stdout
         command = [
-            'ffmpeg',
+            resolve_ffmpeg_tool('ffmpeg'),
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
             '-s', f'{self.width}x{self.height}',  # size of one frame

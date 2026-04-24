@@ -5,6 +5,7 @@ import numpy as np
 import json
 import requests
 from .rectangle import Rectangle
+from .ffmpeg_path import resolve_ffmpeg_tool
 
 def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=None, end_time=None,
                         width=None, height=None, fps=None):
@@ -39,7 +40,7 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
     if width is None or height is None or fps is None:
         # Get video information using ffprobe
         probe_cmd = [
-            'ffprobe',
+            resolve_ffmpeg_tool('ffprobe'),
             '-v', 'quiet',
             '-print_format', 'json',
             '-show_streams',
@@ -97,7 +98,7 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
         raise ValueError("Either frame numbers or timestamps must be provided")
 
     # Build ffmpeg command
-    cmd = ['ffmpeg', '-ss', str(start_time)]
+    cmd = [resolve_ffmpeg_tool('ffmpeg'), '-ss', str(start_time)]
 
     # Add time selection
     cmd.extend(['-i', video_url, '-t', str(duration)])
