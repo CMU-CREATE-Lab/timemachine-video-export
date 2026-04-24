@@ -55,6 +55,7 @@ env/
 test_outputs/
 
 # Local secrets and runtime artifacts
-secrets/
-exports/
+# (secrets and exports are symlinks in this repo, so no trailing slash)
+secrets
+exports
 export_log_*.txt
