@@ -1,6 +1,7 @@
 from functools import cache
 import os
 import sys
+import time
 import dateutil
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -33,9 +34,12 @@ def client():
     client = gspread.authorize(creds)
     return client
 
-required_columns = ["Site", "Date", "Begin time", "End time", "Video", "Notes"]
+required_columns = ["Site", "Date", "Begin time", "End time", "Video", "Status", "Notes"]
 first_col = "A"
 last_col = chr(ord("A") + len(required_columns) - 1)
+
+# Minimum seconds between Status-column updates during a render (rate-limits Sheets API).
+STATUS_UPDATE_THROTTLE_S = 10
 # Use the configured export directory
 export_directory = BREATHECAM_EXPORT_DIR
 
@@ -60,8 +64,9 @@ class BatchVideoExporter:
         assert header == required_columns
 
         df = pd.DataFrame(data_rows, columns=header)
-        # None in Video or Notes columns should be empty string instead
+        # None in Video/Status/Notes columns should be empty string instead
         df["Video"] = df["Video"].fillna("")
+        df["Status"] = df["Status"].fillna("")
         df["Notes"] = df["Notes"].fillna("")
 
         return df
@@ -91,22 +96,48 @@ class BatchVideoExporter:
 
         row_idx = row.name
         start_time = datetime.datetime.now(pytz.UTC).astimezone()
-        self.update_spreadsheet_cell(row_idx, f"Started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        start_marker = f"Started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        # Mark Video so concurrent workers skip this row; mirror in Status for visibility.
+        self.update_cell(row_idx, "Video", start_marker)
+        self.update_cell(row_idx, "Status", start_marker)
+        self._style_status_cell(row_idx)
+
+        last_status_update = [0.0]
+        def on_progress(msg):
+            now = time.monotonic()
+            if now - last_status_update[0] < STATUS_UPDATE_THROTTLE_S:
+                return
+            last_status_update[0] = now
+            try:
+                self.update_cell(row_idx, "Status", msg)
+            except Exception as ex:
+                print(f"BatchVideoExporter: failed to update Status: {ex}")
 
         try:
             with Stopwatch(f"Exporting video for {site} from {begin_datetime} to {end_datetime}"):
-                render_video_site(site, begin_datetime, end_datetime, export_path, use_original_full_res=True)
+                stats = render_video_site(site, begin_datetime, end_datetime, export_path,
+                                          use_original_full_res=True, progress_callback=on_progress)
                 print(f"BatchVideoExporter: Exported video to {export_path} ({os.path.getsize(export_path)/1e6:.06f} MB)")
 
             web_export_prefix = "https://videos.breathecam.org/"
 
             video_url = web_export_prefix + os.path.basename(export_path)
             video_link = f'=hyperlink("{video_url}", "{os.path.basename(export_path)}")'
-            self.update_spreadsheet_cell(row_idx, video_link)
+            self.update_cell(row_idx, "Video", video_link)
+            size_gb = os.path.getsize(export_path) / 1e9
+            final_status = (
+                f"Rendered {stats['width']}x{stats['height']}, "
+                f"{stats['frames']} frames in {stats['elapsed_s']:.1f}s "
+                f"({stats['fps']:.2f} fps), {size_gb:.3f} GB, "
+                f"CPU: {stats['py_cpu_pct']:.0f}% py + {stats['child_cpu_pct']:.0f}% ffmpeg"
+            )
+            self.update_cell(row_idx, "Status", final_status)
             return export_path
 
         except Exception as e:
-            self.update_spreadsheet_cell(row_idx, f"Error: {str(e)}")
+            err = f"Error: {str(e)}"
+            self.update_cell(row_idx, "Video", err)
+            self.update_cell(row_idx, "Status", err)
             raise
 
     def export_next(self):
@@ -132,8 +163,9 @@ class BatchVideoExporter:
             return None
         return eligible_rows.iloc[0]
 
-    def update_spreadsheet_cell(self, row_idx, value):
-        """Update the Video cell for the given row, but verify row contents first"""
+    def update_cell(self, row_idx, col_name, value):
+        """Update one cell for the given row, verifying the row's key fields first."""
+        assert col_name in required_columns, f"Unknown column: {col_name}"
         worksheet = client().open(self.spreadsheet_name).worksheets()[0]
         # Spreadsheet rows are 1-based and include header
         sheet_row = row_idx + 2
@@ -156,11 +188,22 @@ class BatchVideoExporter:
                 f"Begin: {row_data[2]}, End: {row_data[3]}"
             )
 
-        # If verification passes, update the cell
-        # Update using row/col numbers instead of A1 notation
-        worksheet.update_cell(sheet_row, 5, value)  # 5 is the column number for "Video" (E)
-        # Update local dataframe
-        self.df.at[row_idx, "Video"] = value
+        col_number = required_columns.index(col_name) + 1  # 1-based sheet column
+        worksheet.update_cell(sheet_row, col_number, value)
+        self.df.at[row_idx, col_name] = value
+
+    def _style_status_cell(self, row_idx):
+        """Apply wrap + small font to a row's Status cell so long progress lines fit."""
+        worksheet = client().open(self.spreadsheet_name).worksheets()[0]
+        sheet_row = row_idx + 2
+        col_letter = chr(ord("A") + required_columns.index("Status"))
+        try:
+            worksheet.format(f"{col_letter}{sheet_row}", {
+                "wrapStrategy": "WRAP",
+                "textFormat": {"fontSize": 9},
+            })
+        except Exception as ex:
+            print(f"BatchVideoExporter: failed to style Status cell: {ex}")
 
 
 

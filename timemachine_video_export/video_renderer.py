@@ -178,7 +178,7 @@ class OutputToVideo:
         # Atomic rename of temp file to final path
         os.replace(self.export_path, self.export_path)
 
-def render_video_site(site: str, begin_datetime: datetime.datetime, end_datetime: datetime.datetime, export_path: str, use_original_full_res=False):
+def render_video_site(site: str, begin_datetime: datetime.datetime, end_datetime: datetime.datetime, export_path: str, use_original_full_res=False, progress_callback=None):
     site = site.lower()
     # Replace each string of one or more non-alnum characters with a single _
     site = re.sub(r'[^a-z0-9]+', '_', site)
@@ -214,7 +214,7 @@ def render_video_site(site: str, begin_datetime: datetime.datetime, end_datetime
     assert thumbnail.scale() == (1, 1), "Thumbnail must have a scale of 1:1"
     output = OutputToVideo(export_path, thumbnail.width, thumbnail.height)
 
-    return render_video_from_thumbnail(begin_datetime, end_datetime, output, thumbnail)
+    return render_video_from_thumbnail(begin_datetime, end_datetime, output, thumbnail, progress_callback=progress_callback)
 
 # class OutputToPngs:
 #     def __init__(self, export_path, width, height):
@@ -253,6 +253,7 @@ def render_video(
     end_datetime: datetime.datetime,
     source_rect: Rectangle,
     output: OutputToVideo,
+    progress_callback=None,
 ):
     """Render a video from a TimeMachine root URL.
 
@@ -261,6 +262,11 @@ def render_video(
         begin_datetime, end_datetime: timezone-aware datetimes bounding the frames to render
         source_rect: Rectangle in full-resolution TimeMachine coordinates (may be non-integer)
         output: sink with .width/.height/.write_frame/.close (output dimensions come from this)
+        progress_callback: optional callable(str); invoked after each chunk with a human-readable status line
+
+    Returns:
+        dict with keys: width, height, frames, elapsed_s, fps, py_cpu_pct, child_cpu_pct
+        (cpu percentages: 100% = one fully-saturated core; child covers ffmpeg subprocesses)
     """
     assert begin_datetime.tzinfo is not None, "begin_datetime must have a timezone"
     assert end_datetime.tzinfo is not None, "end_datetime must have a timezone"
@@ -277,6 +283,7 @@ def render_video(
     nframes = end_frame - start_frame + 1
 
     render_start_time = time.monotonic()
+    start_times = os.times()
 
     # We have to process in small chunks or we run out of RAM
     chunk_size = 200
@@ -298,6 +305,8 @@ def render_video(
 
     # Use multiple workers but process results in order to avoid memory buildup
     max_workers = 1
+    total_chunks = len(chunk_infos)
+    frames_done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit first batch of jobs
         pending_futures = {}
@@ -326,22 +335,49 @@ def render_video(
                 # Write frames to ffmpeg process
                 for frame in frames:
                     output.write_frame(frame)
+                frames_done += len(frames)
+
+                if progress_callback:
+                    chunk_elapsed = time.monotonic() - render_start_time
+                    chunk_fps = frames_done / chunk_elapsed if chunk_elapsed > 0 else 0.0
+                    pct = 100 * frames_done // nframes if nframes else 0
+                    progress_callback(
+                        f"Rendering chunk {chunk_idx + 1}/{total_chunks} "
+                        f"({pct}%): {frames_done}/{nframes} frames at {chunk_fps:.2f} fps"
+                    )
     output.close()
 
     elapsed = time.monotonic() - render_start_time
+    end_times = os.times()
+    py_cpu_s = (end_times.user - start_times.user) + (end_times.system - start_times.system)
+    child_cpu_s = ((end_times.children_user - start_times.children_user)
+                   + (end_times.children_system - start_times.children_system))
+    py_cpu_pct = 100.0 * py_cpu_s / elapsed if elapsed > 0 else 0.0
+    child_cpu_pct = 100.0 * child_cpu_s / elapsed if elapsed > 0 else 0.0
     fps = nframes / elapsed if elapsed > 0 else float('inf')
-    print(f"Rendered {output_width}x{output_height}, {nframes} frames in {elapsed:.1f}s ({fps:.2f} fps)")
+    print(f"Rendered {output_width}x{output_height}, {nframes} frames in {elapsed:.1f}s "
+          f"({fps:.2f} fps; CPU: {py_cpu_pct:.0f}% py + {child_cpu_pct:.0f}% ffmpeg)")
+    return {
+        "width": output_width,
+        "height": output_height,
+        "frames": nframes,
+        "elapsed_s": elapsed,
+        "fps": fps,
+        "py_cpu_pct": py_cpu_pct,
+        "child_cpu_pct": child_cpu_pct,
+    }
 
 
-def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVideo, thumbnail: BreathecamThumbnail):
+def render_video_from_thumbnail(begin_datetime, end_datetime, output: OutputToVideo, thumbnail: BreathecamThumbnail, progress_callback=None):
     output_width = ensure_integer(thumbnail.width)
     output_height = ensure_integer(thumbnail.height)
     assert output.width == output_width, f"Output width {output.width} does not match thumbnail"
     assert output.height == output_height, f"Output height {output.height} does not match thumbnail"
-    render_video(
+    return render_video(
         timemachine_root_url=thumbnail.timemachine_root_url(),
         begin_datetime=begin_datetime,
         end_datetime=end_datetime,
         source_rect=thumbnail.view_rect(),
         output=output,
+        progress_callback=progress_callback,
     )
