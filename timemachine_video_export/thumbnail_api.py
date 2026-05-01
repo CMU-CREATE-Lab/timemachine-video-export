@@ -27,6 +27,30 @@ class Thumbnail:
         parsed_url = urllib.parse.urlparse(url)
         main_params = Thumbnail.parse_query_params(parsed_url)
 
+        # Bare breathecam URL: everything in the #fragment, no thumbnails-v2 envelope.
+        # Synthesize the missing envelope params so the existing parser path handles it.
+        if (parsed_url.netloc.endswith('breathecam.org')
+                and parsed_url.fragment
+                and 'root' not in main_params):
+            frag_params = Thumbnail.parse_query_params(
+                parsed_url._replace(query=parsed_url.fragment))
+            rect = Rectangle.from_pts(frag_params['v'])
+            even_w = int(rect.width) - (int(rect.width) % 2)
+            even_h = int(rect.height) - (int(rect.height) % 2)
+            main_params = {
+                'root': url,
+                'width': str(even_w),
+                'height': str(even_h),
+                'format': 'mp4',
+                'fps': frag_params.get('fps', '12'),
+                'tileFormat': 'mp4',
+            }
+            # Mirror startDwell/endDwell from the fragment so the duplicate-key
+            # consistency check in the parser passes.
+            for k in ('startDwell', 'endDwell'):
+                if k in frag_params:
+                    main_params[k] = frag_params[k]
+
         def round_to_int(str):
             try:
                 return int(float(str))

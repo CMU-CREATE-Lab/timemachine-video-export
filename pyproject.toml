@@ -43,6 +43,7 @@ test = [
 [project.scripts]
 batch-video-exporter = "timemachine_video_export.batch_video_exporter:main"
 timemachine-render = "timemachine_video_export.render_cli:main"
+breathecam-thumbnail-export = "timemachine_video_export.breathecam_export_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
