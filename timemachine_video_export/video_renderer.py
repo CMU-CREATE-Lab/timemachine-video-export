@@ -225,37 +225,6 @@ def render_video_site(site: str, begin_datetime: datetime.datetime, end_datetime
 
     return render_video_from_thumbnail(begin_datetime, end_datetime, output, thumbnail, progress_callback=progress_callback)
 
-# class OutputToPngs:
-#     def __init__(self, export_path, width, height):
-#         self.width = width
-#         self.height = height
-#         self.export_path = export_path
-#         self.frame_number = 0
-#         # Make sure export_path includes something of form %\d*d
-#         # so we can use it as a prefix for the frame numbers
-#         if not re.search(r"%\d*d", export_path):
-#             raise ValueError(f"export_path {export_path} must include a format string of form %d or %NNNd")
-#         os.makedirs(os.path.dirname(export_path), exist_ok=True)
-
-#     # frame is ndarray of uint8 of shape (height, width, 3)
-#     # with pixel values in range 0-255
-#     def write_frame(self, frame: np.ndarray):
-#         # Create a filename for the frame
-#         filename = self.export_path % self.frame_number
-#         # Make sure the suffix is correct
-#         if not filename.endswith(".png"):
-#             raise ValueError(f"Filename {filename} must end with .png")
-#         self.frame_number += 1
-#         # Save the frame as a PNG file
-#         # Use PIL to save the image
-#         from PIL import Image
-#         image = Image.fromarray(frame)
-#         assert image.size == (self.width, self.height), f"Image size {image.size} does not match expected size {(self.width, self.height)}"
-#         image.save(filename, "PNG")
-
-#     def close(self):
-#         pass
-
 def render_video(
     timemachine_root_url: str,
     begin_datetime: datetime.datetime,
