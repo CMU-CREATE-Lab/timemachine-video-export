@@ -5,6 +5,11 @@ Output protocol on stdout:
      the TimeMachine, and the exact frames being emitted.
   2. Raw 8-bit R,G,B pixel bytes: nframes * height * width * 3 bytes,
      frame-major, row-major top-to-bottom, no padding.
+  3. One ASCII-only JSON line (terminated by \\n) with per-stage timing stats.
+
+With --pixels-output PATH the binary frames go to that file and the two JSON
+lines (header + trailing stats) remain on stdout. Useful when you want to
+read the JSON without piping gigabytes through stdout.
 
 Informational logging goes to stderr so the binary stdout stream is clean.
 
@@ -15,6 +20,8 @@ Python consumer:
     pixels = sys.stdin.buffer.read(r['total_pixel_bytes'])
     frames = np.frombuffer(pixels, dtype=np.uint8).reshape(
         r['nframes'], r['output_height'], r['output_width'], 3)
+    stats_line = sys.stdin.buffer.readline()
+    stats = json.loads(stats_line)
 
 Ruby 2.7 consumer:
     require 'json'
@@ -26,6 +33,7 @@ Ruby 2.7 consumer:
       frame = STDIN.read(bytes_per_frame)  # binary string, R,G,B,R,G,B,...
       # ... process frame ...
     end
+    stats = JSON.parse(STDIN.gets)         # trailing stats line
 """
 import argparse
 import json
@@ -70,17 +78,19 @@ def main(argv=None):
                         metavar="WxH",
                         help="Output size in pixels (both even). "
                              "Default: v-rect dimensions rounded down to even.")
+    parser.add_argument("--pixels-output", default=None, metavar="PATH",
+                        help="Debug: write the binary RGB frames to PATH and keep "
+                             "the header + trailing stats JSON lines on stdout. "
+                             "Use /dev/null to discard the pixels entirely.")
     args = parser.parse_args(argv)
 
-    # If writing pixels to stdout, capture binary stdout NOW and redirect text-mode
-    # stdout to stderr before any code can print() to the original stdout (e.g.,
-    # TimeMachine.__init__ logs "Fetching tm.json"). Otherwise those prints would
-    # corrupt the binary stream.
-    if args.output == "-":
-        raw_stdout = sys.stdout.buffer
-        sys.stdout = sys.stderr
-    else:
-        raw_stdout = None
+    # Capture binary stdout NOW and redirect text-mode stdout to stderr before
+    # any code can print() to the original stdout (e.g., TimeMachine.__init__
+    # logs "Fetching tm.json"). Otherwise those prints would corrupt the
+    # protocol on stdout. We need this whenever ANY JSON or pixel data is
+    # destined for stdout — i.e., for both -o - and --pixels-output PATH.
+    raw_stdout = sys.stdout.buffer
+    sys.stdout = sys.stderr
 
     thumbnail = BreathecamThumbnail(args.url)
     begin = thumbnail.begin_time_in_camera_timezone()
@@ -148,26 +158,39 @@ def main(argv=None):
     # consumer reads the header line as bytes and assumes ASCII-only content.
     header = json.dumps(metadata, ensure_ascii=True).encode("ascii") + b"\n"
 
-    if raw_stdout is not None:
-        raw_stdout.write(header)
-        raw_stdout.flush()
-        render_video(
+    # Decide where header JSON, pixel frames, and trailing stats JSON each go.
+    if args.pixels_output is not None:
+        # Debug split: JSON to stdout, pixels to a separate file.
+        json_stream = raw_stdout
+        pixel_stream = open(args.pixels_output, "wb")
+        close_pixel_stream = True
+    elif args.output == "-":
+        json_stream = raw_stdout
+        pixel_stream = raw_stdout
+        close_pixel_stream = False
+    else:
+        pixel_stream = open(args.output, "wb")
+        json_stream = pixel_stream  # all three sections concatenated into one file
+        close_pixel_stream = True
+
+    try:
+        json_stream.write(header)
+        json_stream.flush()
+        result = render_video(
             timemachine_root_url=tm_url,
             begin_datetime=begin,
             end_datetime=end,
             source_rect=source_rect,
-            output=OutputToStream(raw_stdout, out_w, out_h),
+            output=OutputToStream(pixel_stream, out_w, out_h),
         )
-    else:
-        with open(args.output, "wb") as raw_stream:
-            raw_stream.write(header)
-            render_video(
-                timemachine_root_url=tm_url,
-                begin_datetime=begin,
-                end_datetime=end,
-                source_rect=source_rect,
-                output=OutputToStream(raw_stream, out_w, out_h),
-            )
+        if pixel_stream is not json_stream:
+            pixel_stream.flush()
+        trailer = json.dumps({"stats": result["stats"]}, ensure_ascii=True).encode("ascii") + b"\n"
+        json_stream.write(trailer)
+        json_stream.flush()
+    finally:
+        if close_pixel_stream:
+            pixel_stream.close()
 
 
 if __name__ == "__main__":

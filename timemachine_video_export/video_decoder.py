@@ -1,14 +1,52 @@
 # coded in part with https://claude.ai/chat/2fba7438-0e73-41d5-bd98-313e5d0a57cc
 
+import os
 import subprocess
+import threading
+import time
 import numpy as np
 import json
 import requests
 from .rectangle import Rectangle
 from .ffmpeg_path import resolve_ffmpeg_tool
 
+try:
+    import fcntl
+    # Linux-only: grow the pipe buffer ffmpeg writes into. Default 64 KB
+    # can't hold even one 1424x800 RGB frame (~3.4 MB), so 1 MB is still
+    # smaller than a frame, but it lets ffmpeg buffer ~30% of one ahead.
+    _F_SETPIPE_SZ = 1031
+    _PIPE_TARGET_BYTES = 1024 * 1024
+except ImportError:
+    fcntl = None
+    _F_SETPIPE_SZ = None
+    _PIPE_TARGET_BYTES = None
+
+# subprocess.communicate() reads stdout in 32 KB chunks under a select loop.
+# With many concurrent decoders that adds up to a lot of GIL-bouncing syscalls
+# and serializes the readers; a tight os.read with 1 MB chunks let 8-way
+# parallel same-URL decode go from ~5.9 s wall to ~1.0 s in benchmarks.
+_PIPE_READ_CHUNK = 1024 * 1024
+
+def _wait_with_rusage(process):
+    """Replacement for process.wait() that returns the child's CPU time.
+
+    Uses os.wait4 to capture rusage at reap. Mutates Popen so it agrees that
+    the child is gone (avoids double-reap on __del__).
+    """
+    pid, status, rusage = os.wait4(process.pid, 0)
+    if os.WIFEXITED(status):
+        rc = os.WEXITSTATUS(status)
+    elif os.WIFSIGNALED(status):
+        rc = -os.WTERMSIG(status)
+    else:
+        rc = status
+    process.returncode = rc
+    return rusage.ru_utime + rusage.ru_stime
+
+
 def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=None, end_time=None,
-                        width=None, height=None, fps=None):
+                        width=None, height=None, fps=None, stats=None):
     """
     Decode a range of frames from an MP4 video file accessed via HTTPS.
 
@@ -97,11 +135,39 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
     else:
         raise ValueError("Either frame numbers or timestamps must be provided")
 
-    # Build ffmpeg command
-    cmd = [resolve_ffmpeg_tool('ffmpeg'), '-ss', str(start_time)]
+    # Debug: cache tiles locally so ffmpeg reads from disk instead of HTTPS.
+    # Useful for isolating whether the webserver (or ffmpeg<->webserver
+    # interaction) is the bottleneck. Files are keyed by URL path.
+    input_url = video_url
+    cache_dir = os.environ.get('TILE_CACHE_DIR')
+    if cache_dir:
+        from urllib.parse import urlparse
+        os.makedirs(cache_dir, exist_ok=True)
+        parsed = urlparse(video_url)
+        safe_name = (parsed.netloc + parsed.path).replace('/', '_')
+        local_path = os.path.join(cache_dir, safe_name)
+        if not os.path.exists(local_path):
+            print(f"Caching tile to {local_path}")
+            r = requests.get(video_url, stream=True)
+            r.raise_for_status()
+            tmp_path = local_path + '.tmp'
+            with open(tmp_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+            os.replace(tmp_path, local_path)
+        input_url = local_path
+
+    # Build ffmpeg command. -multiple_requests 1 enables HTTP keep-alive on
+    # the (https?) protocol; with 8 concurrent decoders the parallel wall
+    # drops ~3.7x (6.0s -> 1.7s) vs the default. It's an input-protocol
+    # option, so it must precede -i. Skip it when reading from a local file.
+    cmd = [resolve_ffmpeg_tool('ffmpeg')]
+    if not cache_dir:
+        cmd.extend(['-multiple_requests', '1'])
+    cmd.extend(['-ss', str(start_time)])
 
     # Add time selection
-    cmd.extend(['-i', video_url, '-t', str(duration)])
+    cmd.extend(['-i', input_url, '-t', str(duration)])
 
     # Add output format settings
     cmd.extend([
@@ -111,25 +177,103 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
         '-'
     ])
 
-    # Run ffmpeg process with communicate()
+    if os.environ.get('TILE_DECODE_DEBUG') == '1':
+        print(f"  decode: url={input_url.rsplit('/',3)[-3:]} start_time={start_time:.2f}s duration={duration:.2f}s expected_frames={expected_frames}")
+
+    # Debug mode: redirect ffmpeg stdout to /dev/null so the Python pipe reader
+    # is out of the path. Lets us see whether the per-tile reader is the cap on
+    # ffmpeg's CPU. Returns zero-filled frames of the expected shape so the rest
+    # of the pipeline still runs.
+    if os.environ.get('DECODE_TILES_TO_DEVNULL') == '1':
+        t_wall = time.monotonic()
+        with open(os.devnull, 'wb') as devnull:
+            process = subprocess.Popen(
+                cmd,
+                stdout=devnull,
+                stderr=subprocess.PIPE,
+            )
+            stderr = process.stderr.read()
+            cpu_s = _wait_with_rusage(process)
+        wall_s = time.monotonic() - t_wall
+        if process.returncode != 0:
+            raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
+        if stats is not None:
+            stats.append({'wall_s': wall_s, 'cpu_s': cpu_s})
+        return np.zeros((expected_frames, height, width, 3), dtype=np.uint8)
+
+    # Spawn ffmpeg, drain stdout in a tight os.read loop, and capture stderr in
+    # a thread. The tight loop is the perf-critical part: it lets multiple
+    # concurrent decoders each pull data without contending in select() loops.
+    t_wall = time.monotonic()
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=32 * 1024 * 1024  # Use 32MB buffer size for video data
+            bufsize=0,
         )
-        raw_data, stderr = process.communicate()
+        if fcntl is not None:
+            try:
+                fcntl.fcntl(process.stdout.fileno(), _F_SETPIPE_SZ, _PIPE_TARGET_BYTES)
+            except OSError:
+                pass
+
+        stderr_chunks = []
+        def _drain_stderr():
+            try:
+                while True:
+                    chunk = process.stderr.read(65536)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            except (ValueError, OSError):
+                pass
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        stdout_fd = process.stdout.fileno()
+        expected_bytes = width * height * 3 * expected_frames
+        if os.environ.get('DECODE_DRAIN_DISCARD') == '1':
+            # Drain pipe but discard every chunk; return zeros at the end.
+            # Same os.read tight loop, no chunks list, no join, no reshape.
+            while True:
+                if not os.read(stdout_fd, _PIPE_READ_CHUNK):
+                    break
+            frames = None
+            actual_bytes = expected_bytes
+        else:
+            # Read straight into the final numpy buffer. Avoids the
+            # chunks list + b"".join + np.frombuffer copy chain, which on this
+            # workload roughly doubled wall time per tile (the join had to
+            # allocate and memcpy 640 MiB per tile).
+            frames = np.empty((expected_frames, height, width, 3), dtype=np.uint8)
+            buf = memoryview(frames).cast('B')
+            total = 0
+            while total < expected_bytes:
+                target = buf[total:min(total + _PIPE_READ_CHUNK, expected_bytes)]
+                n = process.stdout.readinto(target)
+                if not n:
+                    break
+                total += n
+            # Catch any unexpected trailing bytes for the size-mismatch error.
+            overage = process.stdout.read() if total == expected_bytes else b""
+            actual_bytes = total + len(overage)
+
+        cpu_s = _wait_with_rusage(process)
+        wall_s = time.monotonic() - t_wall
+        stderr_thread.join()
+        stderr = b"".join(stderr_chunks)
 
         if process.returncode != 0:
             raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
+        if stats is not None:
+            stats.append({'wall_s': wall_s, 'cpu_s': cpu_s})
 
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"FFmpeg error: {e.stderr.decode()}")
 
-    # Verify the output size
-    expected_bytes = width * height * 3 * expected_frames
-    actual_bytes = len(raw_data)
+    if frames is None:
+        return np.zeros((expected_frames, height, width, 3), dtype=np.uint8)
 
     if actual_bytes != expected_bytes:
         raise RuntimeError(
@@ -137,10 +281,6 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
             f"({expected_frames} frames) but got {actual_bytes} bytes "
             f"({actual_bytes // (width * height * 3)} frames)"
         )
-
-    # Reshape into frames
-    frames = np.frombuffer(raw_data, dtype=np.uint8)
-    frames = frames.reshape((expected_frames, height, width, 3))
 
     return frames
 

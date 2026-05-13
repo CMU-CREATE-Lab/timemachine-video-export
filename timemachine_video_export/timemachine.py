@@ -13,11 +13,20 @@ import pandas as pd
 from .video_decoder import decode_video_frames
 import pytz
 import dateutil.parser
+import time
 from functools import cache
 import threading
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
+import cv2
+
+# Cap cv2's internal thread pool. Our resize step also runs inside a Python
+# thread pool (LANCZOS_THREADS, defaults to 16), so the effective concurrency
+# is the product of the two. Letting cv2 default to nproc here gave 16x32=512
+# OS threads on a 32-core box, which destroyed throughput. 4 was the empirical
+# sweet spot in our sweep. Override via CV2_NUM_THREADS.
+cv2.setNumThreads(int(os.environ.get('CV2_NUM_THREADS', 4)))
 
 
 CAMERAS = {
@@ -243,7 +252,7 @@ class TimeMachine:
 
     # output_width, output_height, source_rect (might be non-integers)
 
-    def download_scaled_video_frame_range(self, start_frame_no: int, nframes: int, source_rect: Rectangle, output_width:int, output_height:int, max_threads:int=8):
+    def download_scaled_video_frame_range(self, start_frame_no: int, nframes: int, source_rect: Rectangle, output_width:int, output_height:int, max_threads:int=8, stats:dict=None):
         """
         Download and assemble video tiles into a single numpy array using parallel threads.
 
@@ -289,8 +298,14 @@ class TimeMachine:
             nframes=nframes,
             rect=source_rect_to_download,
             subsample=subsample,
-            max_threads=max_threads
+            max_threads=max_threads,
+            stats=stats,
         )
+        if stats is not None:
+            # Pre-LANCZOS buffer dims (the assembled tile mosaic before resize).
+            stats.setdefault('pre_lanczos_dims', []).append(
+                [download.shape[2], download.shape[1]]
+            )
 
         # Calculate the floating-point crop rectangle within the downloaded frames.
         # source_rect_level is in level coordinates; translate to downloaded frame coordinates
@@ -305,29 +320,70 @@ class TimeMachine:
         # Create output array
         result = np.zeros((nframes, output_height, output_width, 3), dtype=np.uint8)
 
-        # Resize each frame using PIL with floating-point source box.
-        # PIL LANCZOS releases the GIL, so thread-parallelism scales well.
+        # Resize each frame with cv2.resize + INTER_LANCZOS4. We snap the
+        # fractional crop_box to integer pixel boundaries: in practice (for
+        # axis-aligned source rectangles) the offset is already integer; in
+        # the worst case we lose a sub-pixel alignment shift that is
+        # imperceptible. cv2.warpAffine could preserve the sub-pixel crop but
+        # benchmarked ~3x slower than cv2.resize for this scale operation.
+        #
+        # cv2's LANCZOS-4 uses a fixed 8-tap kernel and does not widen on
+        # downsampling, unlike PIL LANCZOS. To restore equivalent antialiasing
+        # we pre-blur the source with a Gaussian whose sigma matches the
+        # downsample ratio per axis (scale-space anti-alias formula). Below
+        # sigma~0.3 the blur has no measurable effect, so we skip it.
+        x1, y1, x2, y2 = crop_box
+        cx1, cy1 = int(math.floor(x1)), int(math.floor(y1))
+        cx2, cy2 = int(math.ceil(x2)), int(math.ceil(y2))
+        sx = (x2 - x1) / output_width
+        sy = (y2 - y1) / output_height
+        sigma_x = 0.5 * math.sqrt(max(sx * sx - 1.0, 0.0))
+        sigma_y = 0.5 * math.sqrt(max(sy * sy - 1.0, 0.0))
+        needs_blur = max(sigma_x, sigma_y) > 0.3
+
+        use_pil = os.environ.get('USE_PIL_RESIZE') == '1'
+        lanczos_cpu_acc = [0.0]
+        lanczos_cpu_lock = threading.Lock()
         def resize_one(i):
-            img = Image.fromarray(download[i])
-            resized = img.resize((output_width, output_height), resample=Image.LANCZOS, box=crop_box)
-            result[i] = np.array(resized)
+            t_cpu = time.thread_time() if stats is not None else 0.0
+            if use_pil:
+                img = Image.fromarray(download[i])
+                resized = img.resize((output_width, output_height), resample=Image.LANCZOS, box=crop_box)
+                result[i] = np.array(resized)
+            else:
+                src = download[i, cy1:cy2, cx1:cx2]
+                if needs_blur:
+                    src = cv2.GaussianBlur(src, (0, 0), sigmaX=sigma_x, sigmaY=sigma_y)
+                result[i] = cv2.resize(src, (output_width, output_height), interpolation=cv2.INTER_LANCZOS4)
+            if stats is not None:
+                d = time.thread_time() - t_cpu
+                with lanczos_cpu_lock:
+                    lanczos_cpu_acc[0] += d
 
         # Only pay the thread-pool overhead when the per-frame resize is large enough
         # to dominate it. Threshold picked empirically: resizes below ~1 megapixel run
         # faster serially.
+        # LANCZOS releases the GIL, so we scale past max_threads (which gates
+        # network/decoder concurrency). 16 was the empirical sweet spot on a
+        # 32-core box; 24+ regressed from thread-pool overhead and memory-bus
+        # contention.
         output_megapixels = (output_width * output_height) / 1_000_000
-        use_threads = nframes > 1 and max_threads > 1 and output_megapixels >= 1.0
+        lanczos_threads = int(os.environ.get('LANCZOS_THREADS', 16))
+        use_threads = nframes > 1 and lanczos_threads > 1 and output_megapixels >= 1.0
         if use_threads:
-            with ThreadPoolExecutor(max_workers=min(max_threads, nframes)) as executor:
+            with ThreadPoolExecutor(max_workers=min(lanczos_threads, nframes)) as executor:
                 for _ in executor.map(resize_one, range(nframes)):
                     pass
         else:
             for i in range(nframes):
                 resize_one(i)
 
+        if stats is not None:
+            stats['lanczos_cpu_s'] = stats.get('lanczos_cpu_s', 0.0) + lanczos_cpu_acc[0]
+
         return result
 
-    def download_video_frame_range(self, start_frame_no: int, nframes: int, rect: Rectangle, subsample:int=1, max_threads:int=8):
+    def download_video_frame_range(self, start_frame_no: int, nframes: int, rect: Rectangle, subsample:int=1, max_threads:int=8, stats:dict=None):
         """
         Download and assemble video tiles into a single numpy array using parallel threads.
 
@@ -386,7 +442,8 @@ class TimeMachine:
                     n_frames=nframes,
                     width = self.tile_width(),
                     height = self.tile_height(),
-                    fps = self.fps()
+                    fps = self.fps(),
+                    stats = stats.setdefault('tile_decoders', []) if stats is not None else None,
                 )
                 return (frames, src_rect, dest_rect)
             except Exception as e:
@@ -412,6 +469,7 @@ class TimeMachine:
 
                 if result_data is not None:
                     frames, src_rect, dest_rect = result_data
+                    t_cpu = time.thread_time() if stats is not None else 0.0
                     result[:,
                            dest_rect.y1:dest_rect.y2,
                            dest_rect.x1:dest_rect.x2,
@@ -419,6 +477,8 @@ class TimeMachine:
                                      src_rect.y1:src_rect.y2,
                                      src_rect.x1:src_rect.x2,
                                      :]
+                    if stats is not None:
+                        stats['composite_cpu_s'] = stats.get('composite_cpu_s', 0.0) + (time.thread_time() - t_cpu)
                 print(f"Completed {i} of {n_tiles} tiles")
         return result
 

@@ -95,6 +95,9 @@ class OutputToStream:
         self.width = width
         self.height = height
         self.stream = stream
+        # No encoder ffmpeg in this output mode.
+        self.encoder_wall_s = None
+        self.encoder_cpu_s = None
 
     def write_frame(self, frame):
         # Write frame to stdout
@@ -116,6 +119,9 @@ class OutputToVideo:
         self.export_path = export_path
         self.ffmpeg_output = []
         self.process = None
+        self.encoder_wall_s = None
+        self.encoder_cpu_s = None
+        self._encoder_start_time = None
 
         # Create temporary filename with pid and thread id
         self.temp_path = f"{export_path}.{os.getpid()}.{threading.get_ident()}.mp4"
@@ -139,6 +145,7 @@ class OutputToVideo:
             self.temp_path
         ]
 
+        self._encoder_start_time = time.monotonic()
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
         # Start a thread to read and capture output
@@ -163,8 +170,10 @@ class OutputToVideo:
         self.process.stdin.flush()
 
     def close(self):
+        from .video_decoder import _wait_with_rusage
         self.process.stdin.close()
-        self.process.wait()
+        self.encoder_cpu_s = _wait_with_rusage(self.process)
+        self.encoder_wall_s = time.monotonic() - self._encoder_start_time
 
         if self.process.returncode == 0:
             # Atomic rename of temp file to final path
@@ -289,10 +298,12 @@ def render_video(
     chunk_size = 200
     frame_chunks = range(start_frame, start_frame + nframes, chunk_size)
 
+    stats = {}
+
     # Download a range of frames, possibly rendering subsamples and extracting/resizing to match requested view rect
     def download_chunk(chunk_info):
         chunk_start, chunk_frames = chunk_info
-        frames = timemachine.download_scaled_video_frame_range(chunk_start, chunk_frames, source_rect, output_width, output_height)
+        frames = timemachine.download_scaled_video_frame_range(chunk_start, chunk_frames, source_rect, output_width, output_height, stats=stats)
         assert frames[0].shape == (output_height, output_width, 3), f"Frame shape {frames[0].shape} does not match expected {(output_height, output_width, 3)}"
         print(f"BatchVideoExporter: Downloaded {len(frames)} frames")
         return frames
@@ -333,8 +344,10 @@ def render_video(
                 print(f"Processing chunk {chunk_idx} ({len(frames)} frames)")
 
                 # Write frames to ffmpeg process
+                t_write = time.monotonic()
                 for frame in frames:
                     output.write_frame(frame)
+                stats['output_write_wall_s'] = stats.get('output_write_wall_s', 0.0) + (time.monotonic() - t_write)
                 frames_done += len(frames)
 
                 if progress_callback:
@@ -357,6 +370,11 @@ def render_video(
     fps = nframes / elapsed if elapsed > 0 else float('inf')
     print(f"Rendered {output_width}x{output_height}, {nframes} frames in {elapsed:.1f}s "
           f"({fps:.2f} fps; CPU: {py_cpu_pct:.0f}% py + {child_cpu_pct:.0f}% ffmpeg)")
+
+    tile_decoders = stats.get('tile_decoders', [])
+    n_decoders = len(tile_decoders)
+    decoder_total_cpu = sum(d['cpu_s'] for d in tile_decoders)
+    decoder_total_wall = sum(d['wall_s'] for d in tile_decoders)
     return {
         "width": output_width,
         "height": output_height,
@@ -365,6 +383,23 @@ def render_video(
         "fps": fps,
         "py_cpu_pct": py_cpu_pct,
         "child_cpu_pct": child_cpu_pct,
+        "stats": {
+            "total_wall_s": elapsed,
+            "tile_decoder_ffmpeg": {
+                "n": n_decoders,
+                "avg_wall_s": (decoder_total_wall / n_decoders) if n_decoders else 0.0,
+                "avg_cpu_s": (decoder_total_cpu / n_decoders) if n_decoders else 0.0,
+                "total_cpu_s": decoder_total_cpu,
+            },
+            "output_encoder_ffmpeg": {
+                "wall_s": output.encoder_wall_s,
+                "cpu_s": output.encoder_cpu_s,
+            },
+            "composite_cpu_s": stats.get('composite_cpu_s', 0.0),
+            "lanczos_cpu_s": stats.get('lanczos_cpu_s', 0.0),
+            "pre_lanczos_dimensions": stats.get('pre_lanczos_dims', []),
+            "output_write_wall_s": stats.get('output_write_wall_s', 0.0),
+        },
     }
 
 

@@ -32,6 +32,7 @@ dependencies = [
     "google-api-python-client",
     "psutil",
     "Pillow",
+    "opencv-python-headless",
 ]
 
 [project.optional-dependencies]
