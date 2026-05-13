@@ -18,7 +18,6 @@ from functools import cache
 import threading
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
-from PIL import Image
 import cv2
 
 # Cap cv2's internal thread pool. Our resize step also runs inside a Python
@@ -341,20 +340,14 @@ class TimeMachine:
         sigma_y = 0.5 * math.sqrt(max(sy * sy - 1.0, 0.0))
         needs_blur = max(sigma_x, sigma_y) > 0.3
 
-        use_pil = os.environ.get('USE_PIL_RESIZE') == '1'
         lanczos_cpu_acc = [0.0]
         lanczos_cpu_lock = threading.Lock()
         def resize_one(i):
             t_cpu = time.thread_time() if stats is not None else 0.0
-            if use_pil:
-                img = Image.fromarray(download[i])
-                resized = img.resize((output_width, output_height), resample=Image.LANCZOS, box=crop_box)
-                result[i] = np.array(resized)
-            else:
-                src = download[i, cy1:cy2, cx1:cx2]
-                if needs_blur:
-                    src = cv2.GaussianBlur(src, (0, 0), sigmaX=sigma_x, sigmaY=sigma_y)
-                result[i] = cv2.resize(src, (output_width, output_height), interpolation=cv2.INTER_LANCZOS4)
+            src = download[i, cy1:cy2, cx1:cx2]
+            if needs_blur:
+                src = cv2.GaussianBlur(src, (0, 0), sigmaX=sigma_x, sigmaY=sigma_y)
+            result[i] = cv2.resize(src, (output_width, output_height), interpolation=cv2.INTER_LANCZOS4)
             if stats is not None:
                 d = time.thread_time() - t_cpu
                 with lanczos_cpu_lock:

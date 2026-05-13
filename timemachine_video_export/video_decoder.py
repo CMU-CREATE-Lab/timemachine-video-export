@@ -177,33 +177,10 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
         '-'
     ])
 
-    if os.environ.get('TILE_DECODE_DEBUG') == '1':
-        print(f"  decode: url={input_url.rsplit('/',3)[-3:]} start_time={start_time:.2f}s duration={duration:.2f}s expected_frames={expected_frames}")
-
-    # Debug mode: redirect ffmpeg stdout to /dev/null so the Python pipe reader
-    # is out of the path. Lets us see whether the per-tile reader is the cap on
-    # ffmpeg's CPU. Returns zero-filled frames of the expected shape so the rest
-    # of the pipeline still runs.
-    if os.environ.get('DECODE_TILES_TO_DEVNULL') == '1':
-        t_wall = time.monotonic()
-        with open(os.devnull, 'wb') as devnull:
-            process = subprocess.Popen(
-                cmd,
-                stdout=devnull,
-                stderr=subprocess.PIPE,
-            )
-            stderr = process.stderr.read()
-            cpu_s = _wait_with_rusage(process)
-        wall_s = time.monotonic() - t_wall
-        if process.returncode != 0:
-            raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
-        if stats is not None:
-            stats.append({'wall_s': wall_s, 'cpu_s': cpu_s})
-        return np.zeros((expected_frames, height, width, 3), dtype=np.uint8)
-
-    # Spawn ffmpeg, drain stdout in a tight os.read loop, and capture stderr in
-    # a thread. The tight loop is the perf-critical part: it lets multiple
-    # concurrent decoders each pull data without contending in select() loops.
+    # Spawn ffmpeg and read its stdout directly into the final numpy buffer.
+    # Reading straight into the preallocated buffer avoids a chunks list +
+    # b"".join + np.frombuffer copy chain that roughly doubled wall time per
+    # tile on this workload (the join had to allocate and memcpy ~640 MiB).
     t_wall = time.monotonic()
     try:
         process = subprocess.Popen(
@@ -231,33 +208,19 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
         stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
         stderr_thread.start()
 
-        stdout_fd = process.stdout.fileno()
         expected_bytes = width * height * 3 * expected_frames
-        if os.environ.get('DECODE_DRAIN_DISCARD') == '1':
-            # Drain pipe but discard every chunk; return zeros at the end.
-            # Same os.read tight loop, no chunks list, no join, no reshape.
-            while True:
-                if not os.read(stdout_fd, _PIPE_READ_CHUNK):
-                    break
-            frames = None
-            actual_bytes = expected_bytes
-        else:
-            # Read straight into the final numpy buffer. Avoids the
-            # chunks list + b"".join + np.frombuffer copy chain, which on this
-            # workload roughly doubled wall time per tile (the join had to
-            # allocate and memcpy 640 MiB per tile).
-            frames = np.empty((expected_frames, height, width, 3), dtype=np.uint8)
-            buf = memoryview(frames).cast('B')
-            total = 0
-            while total < expected_bytes:
-                target = buf[total:min(total + _PIPE_READ_CHUNK, expected_bytes)]
-                n = process.stdout.readinto(target)
-                if not n:
-                    break
-                total += n
-            # Catch any unexpected trailing bytes for the size-mismatch error.
-            overage = process.stdout.read() if total == expected_bytes else b""
-            actual_bytes = total + len(overage)
+        frames = np.empty((expected_frames, height, width, 3), dtype=np.uint8)
+        buf = memoryview(frames).cast('B')
+        total = 0
+        while total < expected_bytes:
+            target = buf[total:min(total + _PIPE_READ_CHUNK, expected_bytes)]
+            n = process.stdout.readinto(target)
+            if not n:
+                break
+            total += n
+        # Catch any unexpected trailing bytes for the size-mismatch error.
+        overage = process.stdout.read() if total == expected_bytes else b""
+        actual_bytes = total + len(overage)
 
         cpu_s = _wait_with_rusage(process)
         wall_s = time.monotonic() - t_wall
@@ -271,9 +234,6 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
 
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"FFmpeg error: {e.stderr.decode()}")
-
-    if frames is None:
-        return np.zeros((expected_frames, height, width, 3), dtype=np.uint8)
 
     if actual_bytes != expected_bytes:
         raise RuntimeError(
