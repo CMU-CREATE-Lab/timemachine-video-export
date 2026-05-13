@@ -135,39 +135,16 @@ def decode_video_frames(video_url, start_frame=None, n_frames=None, start_time=N
     else:
         raise ValueError("Either frame numbers or timestamps must be provided")
 
-    # Debug: cache tiles locally so ffmpeg reads from disk instead of HTTPS.
-    # Useful for isolating whether the webserver (or ffmpeg<->webserver
-    # interaction) is the bottleneck. Files are keyed by URL path.
-    input_url = video_url
-    cache_dir = os.environ.get('TILE_CACHE_DIR')
-    if cache_dir:
-        from urllib.parse import urlparse
-        os.makedirs(cache_dir, exist_ok=True)
-        parsed = urlparse(video_url)
-        safe_name = (parsed.netloc + parsed.path).replace('/', '_')
-        local_path = os.path.join(cache_dir, safe_name)
-        if not os.path.exists(local_path):
-            print(f"Caching tile to {local_path}")
-            r = requests.get(video_url, stream=True)
-            r.raise_for_status()
-            tmp_path = local_path + '.tmp'
-            with open(tmp_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
-            os.replace(tmp_path, local_path)
-        input_url = local_path
-
     # Build ffmpeg command. -multiple_requests 1 enables HTTP keep-alive on
     # the (https?) protocol; with 8 concurrent decoders the parallel wall
     # drops ~3.7x (6.0s -> 1.7s) vs the default. It's an input-protocol
-    # option, so it must precede -i. Skip it when reading from a local file.
-    cmd = [resolve_ffmpeg_tool('ffmpeg')]
-    if not cache_dir:
-        cmd.extend(['-multiple_requests', '1'])
-    cmd.extend(['-ss', str(start_time)])
+    # option, so it must precede -i.
+    cmd = [resolve_ffmpeg_tool('ffmpeg'),
+           '-multiple_requests', '1',
+           '-ss', str(start_time)]
 
     # Add time selection
-    cmd.extend(['-i', input_url, '-t', str(duration)])
+    cmd.extend(['-i', video_url, '-t', str(duration)])
 
     # Add output format settings
     cmd.extend([
