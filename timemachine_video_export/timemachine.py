@@ -267,12 +267,11 @@ class TimeMachine:
             numpy.ndarray: Array of shape (nframes, height, width, 3) containing the video data
         """
 
-        # Compute source tile level and rectangle
-        # max_scale should be <= 1 since we are always downsampling or same-size
+        # Pick the tile level whose resolution is just finer than what we need.
+        # max_scale > 1 means the request is upsampling beyond the deepest tile;
+        # detailed_tile_level_for_scale caps at the max level, and the cv2.resize
+        # below (INTER_LANCZOS4) handles upscaling.
         max_scale = max(output_width / source_rect.width, output_height / source_rect.height)
-        if max_scale > 1:
-            raise ValueError(f"Cannot upsample.  Output size {output_width}x{output_height} is larger than source rect {source_rect.width()}x{source_rect.height()}")
-
         tile_level = self.detailed_tile_level_for_scale(max_scale)
         # Adjust source_rect to match tile level subsample
         subsample = self.subsample_from_level(tile_level)
@@ -503,11 +502,9 @@ class TimeMachine:
     def detailed_tile_level_for_scale(self, scale:float) -> int:
         """
         Given a desired scale (output size / source size), return the tile level that produces more detail
-        than the request, within the valid range of levels.
+        than the request, within the valid range of levels. For scale > 1 (upsampling beyond the deepest
+        tile), we cap at the max level — caller is expected to do the actual upscale.
         """
-        if scale > 1:
-            raise ValueError("Scale must be <= 1.0")
-
         max_level = len(self.level_info()) - 1
         desired_tile_level = max_level - math.log2(1 / scale)
         if desired_tile_level.is_integer():
